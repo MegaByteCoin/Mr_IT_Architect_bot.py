@@ -5,7 +5,7 @@ from socketserver import TCPServer
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 BOT_TOKEN = "8749606311:AAF9cDDB3qS7XAyFCC4t1vnWPB6lnvC961E"
-MODEL_NAME = "qwen2.5:1.5b"
+MODEL_NAME = "qwen2.5:7b"
 MEMORY_FILE = "bot_memory.json"
 bot = telebot.TeleBot(BOT_TOKEN)
 
