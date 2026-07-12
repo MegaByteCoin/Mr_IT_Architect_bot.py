@@ -952,6 +952,20 @@ def listen_loop(
         log(f"Игровой режим активен: {GAME_NAMES.get(game_type, game_type)}. Команды: !игра, !старт, !стоп.")
 
     while True:
+              # Динамическое чтение настроек из JSON-файла, созданного Telegram-ботом
+        try:
+            safe_name = re.sub(r"\W+", "_", nick)
+            config_path = f"./configs/{safe_name}.json"
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f_cfg:
+                    live_cfg = json.load(f_cfg)
+                    delay_min = float(live_cfg.get("delay_min", delay_min))
+                    delay_max = float(live_cfg.get("delay_max", delay_max))
+                    user_cooldown = int(live_cfg.get("cooldown", user_cooldown))
+                    rpm = int(live_cfg.get("max_answers_per_min", rpm))
+                    mention_only = bool(live_cfg.get("only_mention", mention_only))
+        except Exception:
+            pass
         try:
             params = {
                 'act':  'listen',
