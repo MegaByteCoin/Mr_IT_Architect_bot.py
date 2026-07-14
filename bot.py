@@ -899,6 +899,56 @@ def check_broadcast(broadcast_file: str, last_broadcast_id: int, session, ajax_u
     return last_broadcast_id, pv
 
 
+def get_llama_response(message: str, prompt: str, model_path: str, timeout: int = 120) -> str | None:
+    """Получить ответ от Ollama API для сообщения."""
+    import requests
+    import json
+    
+    log(f"[DEBUG] get_llama_response вызван: message='{message[:30]}...', prompt='{prompt[:30]}...', model_path='{model_path}'")
+    
+    # Не использовать для очень длинных сообщений
+    if len(message) > 100:
+        log(f"Сообщение слишком длинное ({len(message)} символов), пропускаем Ollama")
+        return None
+    
+    # Формируем полный промпт с системным сообщением и пользовательским
+    full_prompt = f"{prompt}\n\nUser: {message}\nAssistant:"
+    log(f"[DEBUG] full_prompt='{full_prompt[:100]}...'")
+    
+    # Используем локальный API Ollama, который работает в фоне
+    url = "http://localhost:11434/api/generate"
+    
+    # Формируем легкий JSON-запрос к модели 3B
+    payload = {
+        "model": "qwen2.5:3b",
+        "prompt": full_prompt,
+        "stream": False,
+        "options": {
+            "num_predict": 50,
+            "temperature": 0.6
+        }
+    }
+    
+    try:
+        log(f"[DEBUG] Отправляю запрос в Ollama API")
+        response = requests.post(url, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            response_text = result.get("response", "").strip()
+            log(f"[DEBUG] Ответ получен от Ollama: '{response_text[:50] if response_text else 'None'}...'")
+            return response_text if response_text else None
+        else:
+            log(f"Ошибка Ollama API: Код {response.status_code}")
+            return None
+    except requests.Timeout:
+        log("Ollama API не ответил за время таймаута")
+        return None
+    except Exception as e:
+        log(f"Ошибка отправки запроса в Ollama: {e}")
+        return None
+
+
 def listen_loop(
     session: requests.Session,
     ajax_url: str,
@@ -917,6 +967,9 @@ def listen_loop(
     game_type: str = 'guess',
     broadcast_file: str = '',
     live_chat_presence: bool = False,
+    prompt: str = 'Ты — полезный ИИ ассистент в чате.',
+    ollama_model: str = 'qwen2.5:7b',
+    use_ollama: bool = False,
 ):
     errors = 0
     user_last_reply: dict = {}
@@ -950,24 +1003,42 @@ def listen_loop(
         log("Файл весов не загружен — автоответы выключены.")
     if game_mode:
         log(f"Игровой режим активен: {GAME_NAMES.get(game_type, game_type)}. Команды: !игра, !старт, !стоп.")
-    # Инициализация безопасной фоновой очереди сообщений перед началом цикла
-    message_queue = []
+    if use_ollama:
+        log(f"Ollama AI активен: модель {ollama_model}")
 
     while True:
               # Динамическое чтение настроек из JSON-файла, созданного Telegram-ботом
         try:
             safe_name = re.sub(r"\W+", "_", nick)
-            config_path = f"./configs/{safe_name}.json"
+            config_path = f"/root/ai_telegram/configs/{safe_name}.json"
             if os.path.exists(config_path):
                 with open(config_path, "r", encoding="utf-8") as f_cfg:
                     live_cfg = json.load(f_cfg)
-                    delay_min = float(live_cfg.get("delay_min", delay_min))
-                    delay_max = float(live_cfg.get("delay_max", delay_max))
-                    user_cooldown = int(live_cfg.get("cooldown", user_cooldown))
-                    rpm = int(live_cfg.get("max_answers_per_min", rpm))
-                    mention_only = bool(live_cfg.get("only_mention", mention_only))
-        except Exception:
-            pass
+                    new_delay_min = float(live_cfg.get("delay_min", delay_min))
+                    new_delay_max = float(live_cfg.get("delay_max", delay_max))
+                    new_user_cooldown = int(live_cfg.get("cooldown", user_cooldown))
+                    new_rpm = int(live_cfg.get("max_answers_per_min", rpm))
+                    new_mention_only = bool(live_cfg.get("only_mention", mention_only))
+                    new_prompt = str(live_cfg.get("prompt", prompt))
+                    new_use_ollama = bool(live_cfg.get("use_ollama", use_ollama))
+                    new_ollama_model = str(live_cfg.get("ollama_model", ollama_model))
+                    
+                    # Валидация значений
+                    if new_delay_min >= 0 and new_delay_max >= 0 and new_delay_max >= new_delay_min:
+                        delay_min = new_delay_min
+                        delay_max = new_delay_max
+                    if new_user_cooldown >= 0:
+                        user_cooldown = new_user_cooldown
+                    if new_rpm >= 0:
+                        rpm = new_rpm
+                    mention_only = new_mention_only
+                    prompt = new_prompt
+                    use_ollama = new_use_ollama
+                    ollama_model = new_ollama_model
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            log(f"Ошибка чтения конфига: {e}")
+        except Exception as e:
+            log(f"Неожиданная ошибка при чтении конфига: {e}")
         try:
             params = {
                 'act':  'listen',
@@ -1092,13 +1163,23 @@ def listen_loop(
                                 pass
                             else:
                                 reply = None
-                                if weights_format == 'numeric' and numeric_items:
-                                    reply = pick_numeric_reply(numeric_items)
-                                elif rules:
-                                    reply = find_reply(rules, txt, used_replies, channel)
-                                # Fall back to built-in smart replies if no weights match
-                                if not reply:
-                                    reply = find_builtin_reply(txt, nick, used_replies, channel)
+                                # Если включен Ollama - используем только нейросеть, без шаблонов
+                                if use_ollama:
+                                    log(f"Использую Ollama API для ответа на: «{txt[:50]}»")
+                                    reply = get_llama_response(txt, prompt, ollama_model)
+                                    if reply:
+                                        log(f"Ollama API ответ получен: «{reply[:50]}»")
+                                    else:
+                                        log("Ollama API не вернул ответ, пропускаем сообщение")
+                                else:
+                                    # Если Ollama выключен - используем старую логику с шаблонами
+                                    if weights_format == 'numeric' and numeric_items:
+                                        reply = pick_numeric_reply(numeric_items)
+                                    elif rules:
+                                        reply = find_reply(rules, txt, used_replies, channel)
+                                    # Fall back to built-in smart replies if no weights match
+                                    if not reply:
+                                        reply = find_builtin_reply(txt, nick, used_replies, channel)
 
                                 if reply:
                                     now_ts = time.time()
@@ -1152,6 +1233,9 @@ def run_bot(
     game_type: str = 'guess',
     broadcast_file: str = '',
     live_chat_presence: bool = False,
+    prompt: str = 'Ты — полезный ИИ ассистент в чате.',
+    ollama_model: str = 'qwen2.5:7b',
+    use_ollama: bool = False,
 ):
     session = requests.Session()
     session.mount('https://', _TLSAdapter())
@@ -1202,7 +1286,8 @@ def run_bot(
                 user_cooldown=user_cooldown, rpm=rpm, mention_only=mention_only,
                 game_mode=game_mode, game_type=game_type,
                 broadcast_file=broadcast_file,
-                live_chat_presence=live_chat_presence)
+                live_chat_presence=live_chat_presence,
+                prompt=prompt, ollama_model=ollama_model, use_ollama=use_ollama)
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -1225,6 +1310,9 @@ if __name__ == '__main__':
     parser.add_argument('--game-type',    default='guess',          help='Default game type')
     parser.add_argument('--broadcast-file',default=None,            help='Path to broadcast.json')
     parser.add_argument('--live-chat-presence', action='store_true', help='React to enter/leave events (live chat)')
+    parser.add_argument('--prompt', default='Ты — полезный ИИ ассистент в чате.', help='System prompt for Ollama')
+    parser.add_argument('--ollama-model', default='qwen2.5:7b', help='Ollama model to use')
+    parser.add_argument('--use-ollama', action='store_true', help='Enable Ollama AI responses')
     args = parser.parse_args()
 
     log_path = args.log_file
@@ -1263,6 +1351,9 @@ if __name__ == '__main__':
             game_type=args.game_type,
             broadcast_file=args.broadcast_file,
             live_chat_presence=args.live_chat_presence,
+            prompt=args.prompt,
+            ollama_model=args.ollama_model,
+            use_ollama=args.use_ollama,
         )
         log("Бот завершил работу.")
     except Exception as e:
